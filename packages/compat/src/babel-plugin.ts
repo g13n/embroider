@@ -10,6 +10,7 @@ interface State {
       [fromName: string]: string;
     }
   };
+  shouldRewriteRequire: boolean;
 }
 
 function adjustSpecifier(specifier: string, sourceFileName: string, opts: State["opts"]) {
@@ -41,15 +42,23 @@ function makeHBSExplicit(specifier: string, _: string) {
   return specifier;
 }
 
-export default function main(){
+export default function main({ types: t} : { types: any }){
   return {
     visitor: {
       Program: {
         enter: function(_: any, state: State) {
           state.emberCLIVanillaJobs = [];
+          state.shouldRewriteRequire = state.opts.ownName === 'ember-cli-test-loader';
         },
         exit: function(_: any, state: State) {
           state.emberCLIVanillaJobs.forEach(job => job());
+        }
+      },
+      ReferencedIdentifier(path: any, state: State) {
+        if (state.shouldRewriteRequire && path.node.name === 'require' && !path.scope.hasBinding('require')) {
+          path.replaceWith(
+            t.memberExpression(t.identifier('window'), path.node)
+          );
         }
       },
       'ImportDeclaration|ExportNamedDeclaration|ExportAllDeclaration'(path: any, state: State) {
