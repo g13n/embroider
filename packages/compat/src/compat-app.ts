@@ -92,7 +92,22 @@ interface TreeNames {
   configTree: Tree;
 }
 
-class CompatAppBuilder {
+class App {
+  constructor(protected app: Package) {
+  }
+
+  @Memoize()
+  protected get activeAddonDescendants(): Package[] {
+    // todo: filter by addon-provided hook
+    return this.app.findDescendants(dep => dep.isEmberPackage);
+  }
+
+   // todo
+   protected shouldBuildTests = true;
+
+}
+
+class CompatAppBuilder extends App {
 
   // This runs at broccoli-pipeline-construction time, whereas our actual instance
   // only becomes available during actual tree-building time.
@@ -131,16 +146,12 @@ class CompatAppBuilder {
 
   constructor(
     private root: string,
-    private app: Package,
+    app: Package,
     private oldPackage: V1App,
     private configTree: V1Config,
     private analyzer: DependencyAnalyzer
-  ) {}
-
-  @Memoize()
-  private get activeAddonDescendants(): Package[] {
-    // todo: filter by addon-provided hook
-    return this.app.findDescendants(dep => dep.isEmberPackage);
+  ) {
+    super(app);
   }
 
   private get autoRun(): boolean {
@@ -348,9 +359,6 @@ class CompatAppBuilder {
     }
     original.remove();
   }
-
-  // todo
-  private shouldBuildTests = true;
 
   private emberEntrypoints() {
     let entrypoints = ["index.html"];
