@@ -92,8 +92,8 @@ interface TreeNames {
   configTree: Tree;
 }
 
-class App {
-  constructor(protected app: Package) {
+abstract class App {
+  constructor(protected root: string, protected app: Package) {
   }
 
   @Memoize()
@@ -103,8 +103,127 @@ class App {
   }
 
    // todo
-   protected shouldBuildTests = true;
+  protected shouldBuildTests = true;
 
+  protected abstract config(): ConfigContents;
+  protected abstract externals(): string[];
+  protected abstract emberEntrypoints(): string[];
+  protected abstract templateCompilerSource(config: EmberENV): string;
+  protected abstract babelConfig(): { config: BabelConfig, syntheticPlugins: Map<string, string> };
+
+  private clearApp() {
+    for (let name of readdirSync(this.root)) {
+      if (name !== 'node_modules') {
+        removeSync(join(this.root, name));
+      }
+    }
+  }
+
+  private addTemplateCompiler(config: EmberENV) {
+    writeFileSync(
+      join(this.root, "_template_compiler_.js"),
+      this.templateCompilerSource(config),
+      "utf8"
+    );
+  }
+
+  // this is stuff that needs to get set globally before Ember loads. In classic
+  // Ember CLI is was "vendor-prefix" content that would go at the start of the
+  // vendor.js. We are going to make sure it's the first plain <script> in the
+  // HTML that we hand to the final stage packager.
+  private addEmberEnv(config: EmberENV) {
+    writeFileSync(
+      join(this.root, "_ember_env_.js"),
+      `window.EmberENV=${JSON.stringify(config, null, 2)};`,
+      "utf8"
+    );
+  }
+
+  private addBabelConfig() {
+    let { config, syntheticPlugins } = this.babelConfig();
+
+    for (let [name, source] of syntheticPlugins) {
+      let fullName = join(this.root, name);
+      writeFileSync(fullName, source, 'utf8');
+      let index = config.plugins.indexOf(name);
+      config.plugins[index] = fullName;
+    }
+
+    writeFileSync(
+      join(this.root, "_babel_config_.js"),
+      `
+    module.exports = ${JSON.stringify(config, null, 2)};
+    `,
+      "utf8"
+    );
+  }
+
+  private rewriteHTML(htmlTreePath: string) {
+    for (let entrypoint of this.emberEntrypoints()) {
+      let dom = new JSDOM(readFileSync(join(htmlTreePath, entrypoint), "utf8"));
+      this.updateHTML(entrypoint, dom);
+      let outputFile = join(this.root, entrypoint);
+      ensureDirSync(dirname(outputFile));
+      writeFileSync(outputFile, dom.serialize(), "utf8");
+    }
+  }
+
+  async build(inputPaths: OutputPaths<TreeNames>) {
+    // the steps in here are order dependent!
+    let config = this.config();
+
+    // start with a clean app directory, leaving only our node_modules
+    this.clearApp();
+
+    // first thing we add: we're copying only "app-js"
+    // stuff, first from addons, and then from the app itself (so it can
+    // ovewrite the files from addons).
+    for (let addon of this.activeAddonDescendants) {
+      let appJSPath = addon.meta["app-js"];
+      if (appJSPath) {
+        copySync(join(addon.root, appJSPath), this.root);
+      }
+    }
+    copySync(inputPaths.appJS, this.root, { dereference: true });
+
+    // At this point, all app-js and *only* app-js has been copied into the
+    // project, so we can crawl the results to discover what needs to go into
+    // the Javascript entrypoint files.
+    this.writeAppJSEntrypoint(config);
+    this.writeTestJSEntrypoint();
+
+    // now we're clear to copy other things and they won't perturb the
+    // entrypoint files
+    copySync(inputPaths.publicTree, this.root, { dereference: true });
+
+    this.addTemplateCompiler(config.EmberENV);
+    this.addBabelConfig();
+    this.addEmberEnv(config.EmberENV);
+
+    // This is the publicTree we were given. We need to list all the files in
+    // here as "entrypoints", because an "entrypoint" is anything that is
+    // guaranteed to have a valid URL in the final build output.
+    let entrypoints = walkSync(inputPaths.publicTree, {
+      directories: false,
+    });
+
+    let meta: AppMeta = {
+      version: 2,
+      externals: this.externals(),
+      entrypoints: this.emberEntrypoints().concat(entrypoints),
+      ["template-compiler"]: "_template_compiler_.js",
+      ["babel-config"]: "_babel_config_.js",
+    };
+
+    let pkg = cloneDeep(this.app.packageJSON);
+    pkg["ember-addon"] = Object.assign({}, pkg["ember-addon"], meta);
+    writeFileSync(
+      join(this.root, "package.json"),
+      JSON.stringify(pkg, null, 2),
+      "utf8"
+    );
+    this.rewriteHTML(inputPaths.htmlTree);
+  }
 }
 
 class CompatAppBuilder extends App {
@@ -145,13 +264,17 @@ class CompatAppBuilder extends App {
   }
 
   constructor(
-    private root: string,
+    root: string,
     app: Package,
     private oldPackage: V1App,
     private configTree: V1Config,
     private analyzer: DependencyAnalyzer
   ) {
-    super(app);
+    super(root, app);
+  }
+
+  protected config() {
+    return this.configTree.readConfig();
   }
 
   private get autoRun(): boolean {
@@ -230,7 +353,7 @@ class CompatAppBuilder extends App {
   }
 
   @Memoize()
-  private get babelConfig() {
+  protected babelConfig(): { config: BabelConfig, syntheticPlugins: Map<string, string> } {
     let rename = Object.assign(
       {},
       ...this.activeAddonDescendants.map(dep => dep.meta["renamed-modules"])
@@ -360,7 +483,7 @@ class CompatAppBuilder extends App {
     original.remove();
   }
 
-  private emberEntrypoints() {
+  protected emberEntrypoints(): string[] {
     let entrypoints = ["index.html"];
     if (this.shouldBuildTests) {
       entrypoints.push("tests/index.html");
@@ -368,76 +491,7 @@ class CompatAppBuilder extends App {
     return entrypoints;
   }
 
-  private clearApp() {
-    for (let name of readdirSync(this.root)) {
-      if (name !== 'node_modules') {
-        removeSync(join(this.root, name));
-      }
-    }
-  }
-
-  async build(inputPaths: OutputPaths<TreeNames>) {
-    // the steps in here are order dependent!
-
-    // readConfig timing is safe here because configTree is in our input trees.
-    let config = this.configTree.readConfig();
-
-    // start with a clean app directory, leaving only our node_modules
-    this.clearApp();
-
-    // first thing we add: we're copying only "app-js"
-    // stuff, first from addons, and then from the app itself (so it can
-    // ovewrite the files from addons).
-    for (let addon of this.activeAddonDescendants) {
-      let appJSPath = addon.meta["app-js"];
-      if (appJSPath) {
-        copySync(join(addon.root, appJSPath), this.root);
-      }
-    }
-    copySync(inputPaths.appJS, this.root, { dereference: true });
-
-    // At this point, all app-js and *only* app-js has been copied into the
-    // project, so we can crawl the results to discover what needs to go into
-    // the Javascript entrypoint files.
-    this.writeAppJSEntrypoint(config);
-    this.writeTestJSEntrypoint();
-
-    // now we're clear to copy other things and they won't perturb the
-    // entrypoint files
-    copySync(inputPaths.publicTree, this.root, { dereference: true });
-
-    this.addTemplateCompiler(config.EmberENV);
-    this.addBabelConfig();
-    this.addEmberEnv(config.EmberENV);
-
-    let externals = this.combineExternals();
-
-    // This is the publicTree we were given. We need to list all the files in
-    // here as "entrypoints", because an "entrypoint" is anything that is
-    // guaranteed to have a valid URL in the final build output.
-    let entrypoints = walkSync(inputPaths.publicTree, {
-      directories: false,
-    });
-
-    let meta: AppMeta = {
-      version: 2,
-      externals,
-      entrypoints: this.emberEntrypoints().concat(entrypoints),
-      ["template-compiler"]: "_template_compiler_.js",
-      ["babel-config"]: "_babel_config_.js",
-    };
-
-    let pkg = cloneDeep(this.app.packageJSON);
-    pkg["ember-addon"] = Object.assign({}, pkg["ember-addon"], meta);
-    writeFileSync(
-      join(this.root, "package.json"),
-      JSON.stringify(pkg, null, 2),
-      "utf8"
-    );
-    this.rewriteHTML(inputPaths.htmlTree);
-  }
-
-  private combineExternals() {
+  protected externals(): string[] {
     let allAddonNames = new Set(this.activeAddonDescendants.map(d => d.name));
     let externals = new Set();
     for (let addon of this.activeAddonDescendants) {
@@ -463,15 +517,10 @@ class CompatAppBuilder extends App {
     return [...externals.values()];
   }
 
-  // we could just use ember-source/dist/ember-template-compiler directly, but
-  // apparently ember-cli adds some extra steps on top (like stripping BOM), so
-  // we follow along and do those too.
-  private addTemplateCompiler(config: EmberENV) {
+  protected templateCompilerSource(config: EmberENV) {
     let plugins = this.oldPackage.htmlbarsPlugins;
     (global as any).__embroiderHtmlbarsPlugins__ = plugins;
-    writeFileSync(
-      join(this.root, "_template_compiler_.js"),
-      `
+    return `
     var compiler = require('ember-source/vendor/ember/ember-template-compiler');
     var setupCompiler = require('@embroider/core/src/template-compiler').default;
     var EmberENV = ${JSON.stringify(config)};
@@ -480,52 +529,7 @@ class CompatAppBuilder extends App {
       throw new Error('You must run your final stage packager in the same process as CompatApp, because there are unserializable AST plugins');
     }
     module.exports = setupCompiler(compiler, EmberENV, plugins);
-    `,
-      "utf8"
-    );
-  }
-
-  private addBabelConfig() {
-    let { config, syntheticPlugins } = this.babelConfig;
-
-    for (let [name, source] of syntheticPlugins) {
-      let fullName = join(this.root, name);
-      writeFileSync(fullName, source, 'utf8');
-      let index = config.plugins.indexOf(name);
-      config.plugins[index] = fullName;
-    }
-
-    writeFileSync(
-      join(this.root, "_babel_config_.js"),
-      `
-    module.exports = ${JSON.stringify(config, null, 2)};
-    `,
-      "utf8"
-    );
-  }
-
-  // this is stuff that needs to get set globally before Ember loads. In classic
-  // Ember CLI is was "vendor-prefix" content that would go at the start of the
-  // vendor.js. We are going to make sure it's the first plain <script> in the
-  // HTML that we hand to the final stage packager.
-  private addEmberEnv(config: EmberENV) {
-    writeFileSync(
-      join(this.root, "_ember_env_.js"),
-      `
-    window.EmberENV=${JSON.stringify(config, null, 2)};
-    `,
-      "utf8"
-    );
-  }
-
-  private rewriteHTML(htmlTreePath: string) {
-    for (let entrypoint of this.emberEntrypoints()) {
-      let dom = new JSDOM(readFileSync(join(htmlTreePath, entrypoint), "utf8"));
-      this.updateHTML(entrypoint, dom);
-      let outputFile = join(this.root, entrypoint);
-      ensureDirSync(dirname(outputFile));
-      writeFileSync(outputFile, dom.serialize(), "utf8");
-    }
+    `;
   }
 
   private writeAppJSEntrypoint(config: ConfigContents) {
@@ -619,4 +623,10 @@ export default class CompatApp extends BuildStage<TreeNames> {
     let { inTrees, instantiate } = CompatAppBuilder.setup(legacyEmberAppInstance, options);
     super(addons, inTrees, instantiate);
   }
+}
+
+// This isn't trying to be complete, it only shows the bare minimum that we are
+// touching.
+interface BabelConfig {
+  plugins: string[];
 }
