@@ -60,10 +60,8 @@ function * findTrees<NamedTrees>(trees: NamedTrees): IterableIterator<{ name: st
   for (let [name, value] of Object.entries(trees)) {
     if (Array.isArray(value)) {
       yield { name, multi: value.filter(isTree) };
-    } else {
-      if (isTree(value)) {
-        yield { name, single: value };
-      }
+    } else if (isTree(value)) {
+      yield { name, single: value };
     }
   }
 }
