@@ -92,7 +92,66 @@ interface TreeNames {
   configTree: Tree;
 }
 
+interface BaseAsset {
+  // where this asset should be placed, relative to the app's root
+  relativePath: string;
+}
+
+interface OnDiskAsset extends BaseAsset {
+  // absolute path to where we will find it
+  sourcePath: string;
+  kind: "on-disk";
+}
+
+interface InMemoryAsset extends BaseAsset {
+  // the actual bits
+  source: string | Buffer;
+  kind: "in-memory";
+}
+
+interface DOMAsset extends BaseAsset {
+  // an already-parsed document
+  dom: JSDOM;
+
+  // declares that the ember app should be inserted into this asset
+  insertEmberApp?: AppInsertion;
+
+  kind: "dom";
+}
+
+interface AppInsertion {
+  // each of the elements in here points at where we should insert the
+  // corresponding parts of the ember app. We will insert immediately *after*
+  // the pointed-to Node.
+
+  // these are mandatory, whatever you're inserting may need these
+  implicitScripts: HTMLElement;
+  implicitStyles: HTMLElement;
+  javascript: HTMLElement;
+
+  // these are optional because you *may* choose to stick your implicit test
+  // things into specific locations (which we need for backward-compat). But you
+  // can leave these off and we will simply put them in the same places as the
+  // non-test things (assuming this is even a test build, which is a separate
+  // question).
+  separateImplicitTestScripts?: HTMLElement;
+  separateImplicitTestStyles?: HTMLElement;
+
+  isTests: boolean;
+}
+
+type Asset = OnDiskAsset | InMemoryAsset | DOMAsset;
+
+// todo: instead of abstract base class, perhaps an adapter pattern so we have
+// clearer separation.
 abstract class App {
+  protected abstract config(): ConfigContents;
+  protected abstract externals(): string[];
+  protected abstract emberEntrypoints(): string[];
+  protected abstract templateCompilerSource(config: EmberENV): string;
+  protected abstract babelConfig(): { config: BabelConfig, syntheticPlugins: Map<string, string> };
+  protected abstract assets(): Asset[];
+
   constructor(protected root: string, protected app: Package) {
   }
 
@@ -104,12 +163,6 @@ abstract class App {
 
    // todo
   protected shouldBuildTests = true;
-
-  protected abstract config(): ConfigContents;
-  protected abstract externals(): string[];
-  protected abstract emberEntrypoints(): string[];
-  protected abstract templateCompilerSource(config: EmberENV): string;
-  protected abstract babelConfig(): { config: BabelConfig, syntheticPlugins: Map<string, string> };
 
   private clearApp() {
     for (let name of readdirSync(this.root)) {
