@@ -23,6 +23,7 @@ import cloneDeep from 'lodash/cloneDeep';
 import { JSDOM } from 'jsdom';
 import DependencyAnalyzer from './dependency-analyzer';
 import { V1Config, ConfigContents, EmberENV } from './v1-config';
+import App, { Asset } from './app';
 
 const entryTemplate = compile(`
 {{!-
@@ -92,193 +93,6 @@ interface TreeNames {
   configTree: Tree;
 }
 
-interface BaseAsset {
-  // where this asset should be placed, relative to the app's root
-  relativePath: string;
-}
-
-interface OnDiskAsset extends BaseAsset {
-  // absolute path to where we will find it
-  sourcePath: string;
-  kind: "on-disk";
-}
-
-interface InMemoryAsset extends BaseAsset {
-  // the actual bits
-  source: string | Buffer;
-  kind: "in-memory";
-}
-
-interface DOMAsset extends BaseAsset {
-  // an already-parsed document
-  dom: JSDOM;
-
-  // declares that the ember app should be inserted into this asset
-  insertEmberApp?: AppInsertion;
-
-  kind: "dom";
-}
-
-interface AppInsertion {
-  // each of the elements in here points at where we should insert the
-  // corresponding parts of the ember app. We will insert immediately *after*
-  // the pointed-to Node.
-
-  // these are mandatory, whatever you're inserting may need these
-  implicitScripts: HTMLElement;
-  implicitStyles: HTMLElement;
-  javascript: HTMLElement;
-
-  // these are optional because you *may* choose to stick your implicit test
-  // things into specific locations (which we need for backward-compat). But you
-  // can leave these off and we will simply put them in the same places as the
-  // non-test things (assuming this is even a test build, which is a separate
-  // question).
-  separateImplicitTestScripts?: HTMLElement;
-  separateImplicitTestStyles?: HTMLElement;
-
-  isTests: boolean;
-}
-
-type Asset = OnDiskAsset | InMemoryAsset | DOMAsset;
-
-// todo: instead of abstract base class, perhaps an adapter pattern so we have
-// clearer separation.
-abstract class App {
-  protected abstract config(): ConfigContents;
-  protected abstract externals(): string[];
-  protected abstract emberEntrypoints(): string[];
-  protected abstract templateCompilerSource(config: EmberENV): string;
-  protected abstract babelConfig(): { config: BabelConfig, syntheticPlugins: Map<string, string> };
-  protected abstract assets(): Asset[];
-
-  constructor(protected root: string, protected app: Package) {
-  }
-
-  @Memoize()
-  protected get activeAddonDescendants(): Package[] {
-    // todo: filter by addon-provided hook
-    return this.app.findDescendants(dep => dep.isEmberPackage);
-  }
-
-   // todo
-  protected shouldBuildTests = true;
-
-  private clearApp() {
-    for (let name of readdirSync(this.root)) {
-      if (name !== 'node_modules') {
-        removeSync(join(this.root, name));
-      }
-    }
-  }
-
-  private addTemplateCompiler(config: EmberENV) {
-    writeFileSync(
-      join(this.root, "_template_compiler_.js"),
-      this.templateCompilerSource(config),
-      "utf8"
-    );
-  }
-
-  // this is stuff that needs to get set globally before Ember loads. In classic
-  // Ember CLI is was "vendor-prefix" content that would go at the start of the
-  // vendor.js. We are going to make sure it's the first plain <script> in the
-  // HTML that we hand to the final stage packager.
-  private addEmberEnv(config: EmberENV) {
-    writeFileSync(
-      join(this.root, "_ember_env_.js"),
-      `window.EmberENV=${JSON.stringify(config, null, 2)};`,
-      "utf8"
-    );
-  }
-
-  private addBabelConfig() {
-    let { config, syntheticPlugins } = this.babelConfig();
-
-    for (let [name, source] of syntheticPlugins) {
-      let fullName = join(this.root, name);
-      writeFileSync(fullName, source, 'utf8');
-      let index = config.plugins.indexOf(name);
-      config.plugins[index] = fullName;
-    }
-
-    writeFileSync(
-      join(this.root, "_babel_config_.js"),
-      `
-    module.exports = ${JSON.stringify(config, null, 2)};
-    `,
-      "utf8"
-    );
-  }
-
-  private rewriteHTML(htmlTreePath: string) {
-    for (let entrypoint of this.emberEntrypoints()) {
-      let dom = new JSDOM(readFileSync(join(htmlTreePath, entrypoint), "utf8"));
-      this.updateHTML(entrypoint, dom);
-      let outputFile = join(this.root, entrypoint);
-      ensureDirSync(dirname(outputFile));
-      writeFileSync(outputFile, dom.serialize(), "utf8");
-    }
-  }
-
-  async build(inputPaths: OutputPaths<TreeNames>) {
-    // the steps in here are order dependent!
-    let config = this.config();
-
-    // start with a clean app directory, leaving only our node_modules
-    this.clearApp();
-
-    // first thing we add: we're copying only "app-js"
-    // stuff, first from addons, and then from the app itself (so it can
-    // ovewrite the files from addons).
-    for (let addon of this.activeAddonDescendants) {
-      let appJSPath = addon.meta["app-js"];
-      if (appJSPath) {
-        copySync(join(addon.root, appJSPath), this.root);
-      }
-    }
-    copySync(inputPaths.appJS, this.root, { dereference: true });
-
-    // At this point, all app-js and *only* app-js has been copied into the
-    // project, so we can crawl the results to discover what needs to go into
-    // the Javascript entrypoint files.
-    this.writeAppJSEntrypoint(config);
-    this.writeTestJSEntrypoint();
-
-    // now we're clear to copy other things and they won't perturb the
-    // entrypoint files
-    copySync(inputPaths.publicTree, this.root, { dereference: true });
-
-    this.addTemplateCompiler(config.EmberENV);
-    this.addBabelConfig();
-    this.addEmberEnv(config.EmberENV);
-
-    // This is the publicTree we were given. We need to list all the files in
-    // here as "entrypoints", because an "entrypoint" is anything that is
-    // guaranteed to have a valid URL in the final build output.
-    let entrypoints = walkSync(inputPaths.publicTree, {
-      directories: false,
-    });
-
-    let meta: AppMeta = {
-      version: 2,
-      externals: this.externals(),
-      entrypoints: this.emberEntrypoints().concat(entrypoints),
-      ["template-compiler"]: "_template_compiler_.js",
-      ["babel-config"]: "_babel_config_.js",
-    };
-
-    let pkg = cloneDeep(this.app.packageJSON);
-    pkg["ember-addon"] = Object.assign({}, pkg["ember-addon"], meta);
-    writeFileSync(
-      join(this.root, "package.json"),
-      JSON.stringify(pkg, null, 2),
-      "utf8"
-    );
-    this.rewriteHTML(inputPaths.htmlTree);
-  }
-}
-
 class CompatAppBuilder extends App {
 
   // This runs at broccoli-pipeline-construction time, whereas our actual instance
@@ -330,6 +144,32 @@ class CompatAppBuilder extends App {
     return this.configTree.readConfig();
   }
 
+  protected assets(treePaths: OutputPaths<TreeNames>) {
+    // Everything in our traditional public tree is an on-disk asset
+    let assets: Asset[] = walkSync(treePaths.publicTree, {
+      directories: false,
+    }).map((file): Asset => ({
+      kind: 'on-disk',
+      relativePath: file,
+      sourcePath: file
+    }));
+
+    // And we have our two traditional ember HTML entrypoints
+    assets.push(this.emberEntrypoint(treePaths.htmlTree, 'index.html'));
+    if (this.shouldBuildTests) {
+      assets.push(this.emberEntrypoint(treePaths.htmlTree, 'tests/index.html'));
+    }
+
+    return assets;
+  }
+
+  protected copyAppJS(treePaths: OutputPaths<TreeNames>, dest: string) {
+    copySync(treePaths.appJS, dest, { dereference: true });
+  }
+
+  // todo
+  private shouldBuildTests = true;
+
   private get autoRun(): boolean {
     return this.oldPackage.autoRun;
   }
@@ -349,7 +189,7 @@ class CompatAppBuilder extends App {
     }
   }
 
-  private assets(originalBundle: string): any {
+  private separateAssets(originalBundle: string): any {
     let group: "appJS" | "appCSS" | "testJS" | "testCSS";
     let metaKey:
       | "implicit-scripts"
@@ -412,6 +252,41 @@ class CompatAppBuilder extends App {
       ...this.activeAddonDescendants.map(dep => dep.meta["renamed-modules"])
     );
     return this.oldPackage.babelConfig(this.root, rename);
+  }
+
+  private emberEntrypoint(htmlTree: string, relativePath: string): Asset {
+    let dom = new JSDOM(readFileSync(join(htmlTree, relativePath), "utf8"));
+    return {
+      kind: 'dom',
+      relativePath,
+      dom,
+      insertEmberApp: this.prepareInsertion(dom)
+    };
+  }
+
+  private maybeReplace(dom: JSDOM, element: Element | undefined) {
+    if (element) {
+      let placeholder = dom.window.document.createComment('');
+      element.replaceWith(placeholder);
+      return placeholder;
+    }
+  }
+
+  private prepareInsertion(dom: JSDOM): AppInsertion {
+    let scripts = [...dom.window.document.querySelectorAll("script")];
+    let styles = [
+      ...dom.window.document.querySelectorAll('link[rel="stylesheet"]'),
+    ] as HTMLLinkElement[];
+
+    return assertComplete({
+      javascript: this.maybeReplace(dom, this.oldPackage.findAppScript(scripts)),
+      styles: this.maybeReplace(dom, this.oldPackage.findAppStyles(styles)),
+      implicitScripts: this.maybeReplace(dom, this.oldPackage.findVendorScript(scripts)),
+      implicitStyles: this.maybeReplace(dom, this.oldPackage.findVendorStyles(styles)),
+      testJavascript: this.maybeReplace(dom, this.oldPackage.findTestScript(scripts)),
+      implicitTestScripts: this.maybeReplace(dom, this.oldPackage.findTestSupportScript(scripts)),
+      implicitTestStyles: this.maybeReplace(dom, this.oldPackage.findTestSupportStyles(styles)),
+    });
   }
 
   private updateHTML(entrypoint: string, dom: JSDOM) {
@@ -486,7 +361,7 @@ class CompatAppBuilder extends App {
     if (!original) {
       return;
     }
-    for (let insertedScript of this.assets(bundleName)) {
+    for (let insertedScript of this.separateAssets(bundleName)) {
       let s = dom.window.document.createElement("script");
       s.src = relative(dirname(join(this.root, entrypoint)), insertedScript);
       // these newlines make the output more readable
@@ -523,7 +398,7 @@ class CompatAppBuilder extends App {
     if (!original) {
       return;
     }
-    for (let insertedStyle of this.assets(bundleName)) {
+    for (let insertedStyle of this.separateAssets(bundleName)) {
       let s = dom.window.document.createElement("link");
       s.rel = "stylesheet";
       s.href = relative(dirname(join(this.root, entrypoint)), insertedStyle);
@@ -536,7 +411,7 @@ class CompatAppBuilder extends App {
     original.remove();
   }
 
-  protected emberEntrypoints(): string[] {
+  private emberEntrypoints(): string[] {
     let entrypoints = ["index.html"];
     if (this.shouldBuildTests) {
       entrypoints.push("tests/index.html");
