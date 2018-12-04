@@ -17,69 +17,13 @@ import V1App from './v1-app';
 import walkSync from 'walk-sync';
 import { writeFileSync, ensureDirSync, readFileSync, copySync } from 'fs-extra';
 import { join, dirname, relative } from 'path';
-import { compile } from './js-handlebars';
 import { todo, unsupported } from './messages';
 import cloneDeep from 'lodash/cloneDeep';
 import { JSDOM } from 'jsdom';
 import DependencyAnalyzer from './dependency-analyzer';
 import { V1Config, ConfigContents, EmberENV } from './v1-config';
 import AppDiffer from '@embroider/core/src/app-differ';
-
-const entryTemplate = compile(`
-{{!-
-    This function is the entrypoint that final stage packagers should
-    use to lookup externals at runtime.
--}}
-let w = window;
-let r = w.require;
-let d = w.define;
-w._vanilla_ = function(specifier) {
-  let m;
-  if (specifier === 'require') {
-    m = r;
-  } else {
-    m = r(specifier);
-  }
-  {{!-
-    There are plenty of hand-written AMD defines floating around
-    that lack this, and they will break when other build systems
-    encounter them.
-
-    As far as I can tell, Ember's loader was already treating this
-    case as a module, so in theory we aren't breaking anything by
-    marking it as such when other packagers come looking.
-
-    todo: get review on this part.
-  -}}
-  if (m.default && !m.__esModule) {
-    m.__esModule = true;
-  }
-  return m;
-};
-{{#each lazyModules as |lazyModule| ~}}
-  d("{{js-string-escape lazyModule.runtime}}", function(){ return require("{{js-string-escape lazyModule.buildtime}}");});
-{{/each}}
-{{#if autoRun ~}}
-  require("{{js-string-escape mainModule}}").default.create({{{json-stringify appConfig}}});
-{{/if}}
-`);
-
-const testTemplate = compile(`
-{{#each testModules as |testModule| ~}}
-  import "{{js-string-escape testModule}}";
-{{/each}}
-
-{{#if lazyModules}}
-  let d = window.define;
-{{/if}}
-{{#each lazyModules as |lazyModule| ~}}
-  d("{{js-string-escape lazyModule.runtime}}", function(){ return require("{{js-string-escape lazyModule.buildtime}}");});
-{{/each}}
-
-{{!- this is the traditioanl tests-suffix.js -}}
-require('../tests/test-helper');
-EmberENV.TESTS_FILE_LOADED = true;
-`);
+import { Asset, AppInsertion, appInsertion, ImplicitSection } from './app';
 
 class Options {
   extraPublicTrees?: Tree[];
@@ -144,15 +88,106 @@ class CompatAppBuilder {
     return this.app.findDescendants(dep => dep.isEmberPackage);
   }
 
-  private get autoRun(): boolean {
+  autoRun(): boolean {
     return this.oldPackage.autoRun;
+  }
+
+  assets(treePaths: OutputPaths<TreeNames>) {
+    // Everything in our traditional public tree is an on-disk asset
+    let assets: Asset[] = walkSync(treePaths.publicTree, {
+      directories: false,
+    }).map((file): Asset => ({
+      kind: 'on-disk',
+      relativePath: file,
+      sourcePath: file
+    }));
+
+    // And we have our two traditional ember HTML entrypoints
+    assets.push(this.emberEntrypoint(treePaths.htmlTree, 'index.html'));
+    if (this.shouldBuildTests) {
+      assets.push(this.emberEntrypoint(treePaths.htmlTree, 'tests/index.html'));
+    }
+
+    return assets;
+  }
+
+  mainModule(): string {
+    return this.isModuleUnification ? "src/main" : "app";
+  }
+
+  private emberEntrypoint(htmlTree: string, relativePath: string): Asset {
+    let dom = new JSDOM(readFileSync(join(htmlTree, relativePath), "utf8"));
+    return {
+      kind: 'dom',
+      relativePath,
+      dom,
+      insertEmberApp: this.prepareInsertion(dom)
+    };
+  }
+
+  private maybeReplace(dom: JSDOM, element: Element | undefined) {
+    if (element) {
+      let placeholder = dom.window.document.createComment('');
+      element.replaceWith(placeholder);
+      return placeholder;
+    }
+  }
+
+  private prepareInsertion(dom: JSDOM): AppInsertion {
+    let scripts = [...dom.window.document.querySelectorAll("script")];
+    let styles = [
+      ...dom.window.document.querySelectorAll('link[rel="stylesheet"]'),
+    ] as HTMLLinkElement[];
+
+    return appInsertion({
+      javascript: this.maybeReplace(dom, this.oldPackage.findAppScript(scripts)),
+      styles: this.maybeReplace(dom, this.oldPackage.findAppStyles(styles)),
+      implicitScripts: this.maybeReplace(dom, this.oldPackage.findVendorScript(scripts)),
+      implicitStyles: this.maybeReplace(dom, this.oldPackage.findVendorStyles(styles)),
+      testJavascript: this.maybeReplace(dom, this.oldPackage.findTestScript(scripts)),
+      implicitTestScripts: this.maybeReplace(dom, this.oldPackage.findTestSupportScript(scripts)),
+      implicitTestStyles: this.maybeReplace(dom, this.oldPackage.findTestSupportStyles(styles)),
+    });
+  }
+
+  ownImpliedDeps(section: ImplicitSection) {
+    let result = [];
+
+    let imports = new TrackedImports(
+      this.app.name,
+      this.oldPackage.trackedImports
+    );
+
+    let group;
+    if (section === 'implicit-scripts') {
+      group = imports.categorized.appJS;
+    } else if (section === 'implicit-styles') {
+      group = imports.categorized.appCSS;
+    } else if (section === 'implicit-test-scripts') {
+      group = imports.categorized.testJS;
+    } else if (section === 'implicit-test-styles') {
+      group = imports.categorized.testCSS;
+    }
+
+    if (group) {
+      for (let mod of group) {
+        result.push(resolve.sync(mod, { basedir: this.root }));
+      }
+    }
+
+    // This file gets created by addEmberEnv(). We need to insert it at the
+    // beginning of the scripts.
+    if (section === "implicit-scripts") {
+      result.unshift(join(this.root, "_ember_env_.js"));
+    }
+    return result;
   }
 
   private get isModuleUnification(): boolean {
     return this.oldPackage.isModuleUnification;
   }
 
-  private scriptPriority(pkg: Package) {
+  scriptPriority(pkg: Package) {
     switch (pkg.name) {
       case "loader.js":
         return 0;
@@ -163,7 +198,7 @@ class CompatAppBuilder {
     }
   }
 
-  private assets(originalBundle: string): any {
+  private impliedAssets(originalBundle: string): any {
     let group: "appJS" | "appCSS" | "testJS" | "testCSS";
     let metaKey:
       | "implicit-scripts"
@@ -300,7 +335,7 @@ class CompatAppBuilder {
     if (!original) {
       return;
     }
-    for (let insertedScript of this.assets(bundleName)) {
+    for (let insertedScript of this.impliedAssets(bundleName)) {
       let s = dom.window.document.createElement("script");
       s.src = relative(dirname(join(this.root, entrypoint)), insertedScript);
       // these newlines make the output more readable
@@ -337,7 +372,7 @@ class CompatAppBuilder {
     if (!original) {
       return;
     }
-    for (let insertedStyle of this.assets(bundleName)) {
+    for (let insertedStyle of this.impliedAssets(bundleName)) {
       let s = dom.window.document.createElement("link");
       s.rel = "stylesheet";
       s.href = relative(dirname(join(this.root, entrypoint)), insertedStyle);
@@ -373,8 +408,6 @@ class CompatAppBuilder {
 
   async build(inputPaths: OutputPaths<TreeNames>) {
     let appFiles = this.updateAppJS(inputPaths.appJS);
-
-    // readConfig timing is safe here because configTree is in our input trees.
     let config = this.configTree.readConfig();
 
     // At this point, all app-js and *only* app-js has been copied into the
